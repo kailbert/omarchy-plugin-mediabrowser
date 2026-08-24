@@ -1,8 +1,41 @@
 # Quattro Files
 
+[![Version](https://img.shields.io/badge/version-1.0.0-6f9e78)](https://github.com/kailbert/omarchy-plugin-mediabrowser/releases/tag/v1.0.0)
+[![Development status](https://img.shields.io/badge/status-active%20development-d6a84b)](#project-status)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Quattro Files is a fast, keyboard-first visual filesystem browser for the
 Omarchy Quattro shell. It browses files in place—there is no import step, no
 library, and no copying of user media.
+
+It combines an Eagle-style variable-height media grid, macOS-like Quick Look,
+and the terse keyboard grammar of tools such as Neovim, Yazi, fzf, and lazygit.
+Images keep their natural aspect ratio, videos get cached thumbnails and native
+playback, and ordinary folders and files remain first-class citizens.
+
+## Project status
+
+**Version 1 is in active development and real-world testing.** The core browser
+is usable today, but expect follow-up releases as it is exercised against more
+hardware, themes, codecs, and large personal media collections. Updates may
+arrive quickly during this testing period.
+
+It is not yet submitted to the Omarchy plugin marketplace. Marketplace
+submission is planned after this public testing period.
+
+Please report reproducible problems through
+[GitHub Issues](https://github.com/kailbert/omarchy-plugin-mediabrowser/issues).
+
+## Highlights
+
+- Real filesystem browsing with no imports, proprietary library, or path changes
+- Virtualized waterfall layout that preserves image and video aspect ratios
+- Full-canvas image and video Quick Look with zoom, pan, seek, and metadata
+- Geometric `hjkl` navigation, marks, batch actions, and searchable command palettes
+- Fuzzy directory jumping with bookmarks, recents, and optional zoxide frecency
+- Asynchronous metadata and thumbnail helper with a disposable disk cache
+- Native Omarchy semantic colors, spacing, borders, and live theme behavior
+- Normal Hyprland toplevel behavior: tile it, resize it, or make it fullscreen
 
 ## Requirements
 
@@ -19,11 +52,10 @@ no network access and uses argument arrays for every external process.
 
 ## Install
 
-From a published git repository (replace `<repository-url>` with this
-repository's clone URL):
+Install directly from GitHub:
 
 ```bash
-omarchy plugin add <repository-url> --enable
+omarchy plugin add https://github.com/kailbert/omarchy-plugin-mediabrowser.git --enable
 ```
 
 For local development from this checkout:
@@ -193,3 +225,24 @@ The MVP previews images, animated GIFs, and video. Generic files remain
 browsable and open with the system default application. PDF/text Quick Look,
 global indexing, tags, network-share setup, permanent deletion, and recursive
 search are intentionally outside this release.
+
+## Development and feedback
+
+This repository intentionally has no telemetry, network service, media upload,
+or proprietary database. When reporting a bug, avoid attaching personal media
+or unredacted filesystem paths. A synthetic reproduction and the relevant
+Omarchy/Qt/FFmpeg versions are usually enough.
+
+Before submitting a change, run:
+
+```bash
+qmllint qml/*.qml
+python3 -m py_compile helper/quattro-files-helper
+desktop-file-validate data/quattro-files.desktop
+omarchy plugin validate "$(pwd)"
+git diff --check
+```
+
+## License
+
+[MIT](LICENSE)
