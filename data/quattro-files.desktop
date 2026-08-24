@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Quattro Files
+GenericName=Visual File Browser
+Comment=Browse local photos, videos, folders, and files
+Exec=/usr/bin/omarchy shell shell toggle quattro.files
+Icon=folder-pictures-symbolic
+Terminal=false
+StartupNotify=false
+Categories=Graphics;Photography;
+Keywords=files;folders;photos;images;videos;browser;quick look;

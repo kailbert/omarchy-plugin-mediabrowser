@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Asynchronous filesystem/thumbnail backend for Quattro Files.
+
+Protocol: newline-delimited JSON on stdin/stdout. Filenames are always passed
+as data/argv, never through a shell. Expensive work is bounded and never runs
+on omarchy-shell's UI thread.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import collections
+import hashlib
+import json
+import mimetypes
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif", ".heif", ".heic", ".jxl"}
+VIDEO_EXT = {".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".wmv", ".flv", ".mpeg", ".mpg", ".ts", ".mts", ".m2ts", ".ogv", ".3gp"}
+WORKERS = 3
+write_lock = threading.Lock()
+
+
+def emit(obj: dict) -> None:
+    with write_lock:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
+def xdg_dir(env_name: str, fallback: pathlib.Path) -> pathlib.Path:
+    value = os.environ.get(env_name)
+    return pathlib.Path(value).expanduser() if value else fallback
+
+
+HOME = pathlib.Path.home()
+CACHE = xdg_dir("XDG_CACHE_HOME", HOME / ".cache") / "quattro-files" / "thumbs"
+STATE = xdg_dir("XDG_STATE_HOME", HOME / ".local/state") / "quattro-files" / "state.json"
+
+
+def classify(path: pathlib.Path, is_dir: bool) -> tuple[str, str]:
+    if is_dir:
+        return "folder", "inode/directory"
+    ext = path.suffix.lower()
+    mime = mimetypes.guess_type(path.name, strict=False)[0] or "application/octet-stream"
+    if ext in IMAGE_EXT or mime.startswith("image/"):
+        return "image", mime
+    if ext in VIDEO_EXT or mime.startswith("video/"):
+        return "video", mime
+    return "file", mime
+
+
+def cache_key(path: pathlib.Path, stat: os.stat_result, width: int) -> str:
+    raw = os.fsencode(str(path)) + b"\0" + str(stat.st_size).encode() + b"\0" + str(stat.st_mtime_ns).encode() + b"\0" + str(width).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def cached_meta(path: pathlib.Path, stat: os.stat_result, width: int = 640) -> dict | None:
+    key = cache_key(path, stat, width)
+    image = CACHE / key[:2] / (key + ".jpg")
+    meta = image.with_suffix(".json")
+    if not image.is_file() or not meta.is_file():
+        return None
+    try:
+        obj = json.loads(meta.read_text(encoding="utf-8"))
+        obj["thumbnail"] = str(image)
+        return obj
+    except (OSError, ValueError):
+        return None
+
+
+def list_directory(req: dict) -> None:
+    serial = int(req.get("serial", 0))
+    raw_path = str(req.get("path", ""))
+    show_hidden = bool(req.get("hidden", False))
+    path = pathlib.Path(raw_path).expanduser()
+    try:
+        path = path.resolve(strict=True)
+        if not path.is_dir():
+            raise NotADirectoryError(str(path))
+        emit({"event": "begin", "serial": serial, "path": str(path)})
+        with os.scandir(path) as scan:
+            for dent in scan:
+                if not show_hidden and dent.name.startswith("."):
+                    continue
+                try:
+                    is_dir = dent.is_dir(follow_symlinks=False)
+                    st = dent.stat(follow_symlinks=False)
+                    item_path = pathlib.Path(dent.path)
+                    kind, mime = classify(item_path, is_dir)
+                    row = {
+                        "event": "entry", "serial": serial, "path": str(item_path),
+                        "name": dent.name, "kind": kind, "mime": mime,
+                        "size": int(st.st_size), "mtime": int(st.st_mtime),
+                        "aspect": 1.5 if is_dir else (1.333 if kind in ("image", "video") else 1.6),
+                        "duration": 0, "thumbnail": "", "broken": False,
+                    }
+                    if kind in ("image", "video"):
+                        cm = cached_meta(item_path, st)
+                        if cm:
+                            row.update({k: cm.get(k, row.get(k)) for k in ("aspect", "duration", "thumbnail")})
+                    emit(row)
+                except OSError as exc:
+                    emit({"event": "entry", "serial": serial, "path": dent.path,
+                          "name": dent.name, "kind": "file", "mime": "application/octet-stream",
+                          "size": 0, "mtime": 0, "aspect": 1.6, "duration": 0,
+                          "thumbnail": "", "broken": True, "error": str(exc)})
+        emit({"event": "end", "serial": serial, "path": str(path)})
+    except OSError as exc:
+        emit({"event": "error", "serial": serial, "operation": "list", "path": raw_path, "message": str(exc)})
+
+
+def find_directories(req: dict) -> None:
+    """Stream a bounded breadth-first directory index for the fuzzy jumper."""
+    request_id = str(req.get("requestId", ""))
+    raw_root = str(req.get("root", HOME))
+    show_hidden = bool(req.get("hidden", False))
+    max_results = max(50, min(2000, int(req.get("limit", 1200))))
+    max_depth = max(1, min(8, int(req.get("depth", 5))))
+    root = pathlib.Path(raw_root).expanduser()
+    skipped = {"node_modules", "__pycache__", ".git", ".cache"}
+    found = 0
+    try:
+        root = root.resolve(strict=True)
+        if not root.is_dir():
+            raise NotADirectoryError(str(root))
+        emit({"event": "directories-begin", "requestId": request_id, "root": str(root)})
+        queue = collections.deque([(root, 0)])
+        while queue and found < max_results:
+            parent, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            try:
+                with os.scandir(parent) as scan:
+                    children = []
+                    for dent in scan:
+                        if dent.name in skipped or (not show_hidden and dent.name.startswith(".")):
+                            continue
+                        try:
+                            if not dent.is_dir(follow_symlinks=False):
+                                continue
+                            child = pathlib.Path(dent.path)
+                            children.append(child)
+                        except OSError:
+                            continue
+                children.sort(key=lambda value: value.name.casefold())
+                for child in children:
+                    if found >= max_results:
+                        break
+                    found += 1
+                    emit({"event": "directory-entry", "requestId": request_id,
+                          "path": str(child), "name": child.name,
+                          "relative": str(child.relative_to(root))})
+                    queue.append((child, depth + 1))
+            except OSError:
+                continue
+        emit({"event": "directories-end", "requestId": request_id,
+              "root": str(root), "count": found, "limited": found >= max_results})
+    except OSError as exc:
+        emit({"event": "directories-error", "requestId": request_id,
+              "root": raw_root, "message": str(exc)})
+
+
+def probe(path: pathlib.Path) -> dict:
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration", "-of", "json", str(path)]
+    cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18, check=False)
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.decode("utf-8", "replace").strip() or "ffprobe failed")
+    data = json.loads(cp.stdout.decode("utf-8", "replace"))
+    width = height = 0
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video" or (stream.get("width") and stream.get("height")):
+            width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+            if width and height:
+                break
+    try:
+        duration = float(data.get("format", {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    return {"width": width, "height": height, "aspect": (width / height if height else 1.333), "duration": duration}
+
+
+def generate_thumbnail(req: dict) -> None:
+    request_id = str(req.get("requestId", ""))
+    raw_path = str(req.get("path", ""))
+    width = max(64, min(2560, int(req.get("width", 640))))
+    kind = str(req.get("kind", "image"))
+    path = pathlib.Path(raw_path)
+    try:
+        st = path.stat()
+        key = cache_key(path, st, width)
+        directory = CACHE / key[:2]
+        image = directory / (key + ".jpg")
+        meta_file = image.with_suffix(".json")
+        if image.is_file() and meta_file.is_file():
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            emit({"event": "thumbnail", "requestId": request_id, "path": raw_path,
+                  "thumbnail": str(image), **meta})
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        meta = probe(path)
+        temp = directory / (key + ".tmp.jpg")
+        vf = f"scale='min({width},iw)':-2:flags=lanczos,format=yuvj420p"
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+        if kind == "video" and meta["duration"] > 0:
+            cmd += ["-ss", f"{min(max(meta['duration'] * .1, .5), 30):.3f}"]
+        cmd += ["-i", str(path), "-frames:v", "1", "-vf", vf, "-q:v", "3", str(temp)]
+        cp = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=35, check=False)
+        if cp.returncode != 0 or not temp.is_file():
+            if kind == "image" and shutil.which("magick"):
+                cp = subprocess.run(["magick", str(path) + "[0]", "-auto-orient", "-thumbnail", f"{width}x{width * 8}>", str(temp)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=35, check=False)
+            if cp.returncode != 0 or not temp.is_file():
+                raise RuntimeError(cp.stderr.decode("utf-8", "replace").strip() or "thumbnail generation failed")
+        os.replace(temp, image)
+        meta_file.write_text(json.dumps(meta, separators=(",", ":")), encoding="utf-8")
+        emit({"event": "thumbnail", "requestId": request_id, "path": raw_path,
+              "thumbnail": str(image), **meta})
+    except Exception as exc:
+        emit({"event": "thumbnail-error", "requestId": request_id, "path": raw_path, "message": str(exc)})
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temp = STATE.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, STATE)
+
+
+def places() -> list[dict]:
+    result = []
+    known = [("Home", HOME), ("Pictures", HOME / "Pictures"), ("Videos", HOME / "Videos"), ("Downloads", HOME / "Downloads"), ("Documents", HOME / "Documents")]
+    icons = ["󰋜", "󰋩", "󰕧", "󰇚", "󰈙"]
+    for (name, path), icon in zip(known, icons):
+        if path.is_dir():
+            result.append({"name": name, "path": str(path), "icon": icon, "mounted": False})
+    seen = {x["path"] for x in result}
+    try:
+        for base in (pathlib.Path("/run/media") / os.environ.get("USER", ""), pathlib.Path("/media") / os.environ.get("USER", "")):
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir() and str(child) not in seen:
+                        result.append({"name": child.name, "path": str(child), "icon": "󰋊", "mounted": True})
+    except OSError:
+        pass
+    return result
+
+
+def action(req: dict) -> None:
+    op = str(req.get("operation", ""))
+    request_id = str(req.get("requestId", ""))
+    path = pathlib.Path(str(req.get("path", "")))
+    try:
+        if op == "rename":
+            name = str(req.get("name", ""))
+            if not name or name in (".", "..") or "/" in name or "\0" in name:
+                raise ValueError("Invalid filename")
+            destination = path.parent / name
+            if destination.exists():
+                raise FileExistsError(f"{name} already exists")
+            os.rename(path, destination)
+            emit({"event": "action", "requestId": request_id, "operation": op, "ok": True, "path": str(destination)})
+        elif op == "state":
+            value = req.get("value", {})
+            if not isinstance(value, dict):
+                raise ValueError("State must be an object")
+            save_state(value)
+            emit({"event": "action", "requestId": request_id, "operation": op, "ok": True})
+        else:
+            raise ValueError("Unsupported operation")
+    except Exception as exc:
+        emit({"event": "action", "requestId": request_id, "operation": op, "ok": False, "message": str(exc)})
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] != "serve":
+        print("usage: quattro-files-helper serve", file=sys.stderr)
+        return 2
+    CACHE.mkdir(parents=True, exist_ok=True)
+    emit({"event": "ready", "version": 1, "state": load_state(), "places": places(), "workers": WORKERS})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="qf-thumb") as pool:
+        for line in sys.stdin:
+            try:
+                req = json.loads(line)
+                command = req.get("command")
+                if command == "list":
+                    threading.Thread(target=list_directory, args=(req,), daemon=True).start()
+                elif command == "find-directories":
+                    threading.Thread(target=find_directories, args=(req,), daemon=True).start()
+                elif command == "thumbnail":
+                    pool.submit(generate_thumbnail, req)
+                elif command == "action":
+                    pool.submit(action, req)
+                elif command == "ping":
+                    emit({"event": "pong"})
+                elif command == "quit":
+                    return 0
+                else:
+                    emit({"event": "error", "operation": "protocol", "message": "Unknown command"})
+            except Exception as exc:
+                emit({"event": "error", "operation": "protocol", "message": str(exc)})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

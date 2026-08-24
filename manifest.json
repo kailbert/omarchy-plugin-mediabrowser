@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "quattro.files",
+  "name": "Quattro Files",
+  "version": "0.1.0",
+  "author": "Quattro Files contributors",
+  "license": "MIT",
+  "description": "A fast, theme-native visual filesystem browser with masonry media browsing and Quick Look",
+  "kinds": ["panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "qml/Files.qml"
+  }
+}
