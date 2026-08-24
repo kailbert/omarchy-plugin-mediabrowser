@@ -17,11 +17,12 @@ Item {
   property var pendingRows: []
   property var matches: []
   property int selectedIndex: 0
+  property var seeds: []
 
   signal chosen(string path)
   signal closeRequested()
 
-  function show(rootPath) {
+  function show(rootPath, seedRows) {
     if (!backend) return
     scanRoot = String(rootPath || "")
     requestId = backend.nextRequestId("directories")
@@ -33,8 +34,9 @@ Item {
     scanning = true
     limited = false
     opened = true
+    seeds = seedRows || []
     backend.send({command: "find-directories", requestId: requestId, root: scanRoot,
-                  hidden: false, depth: 5, limit: 1200})
+                  hidden: false, depth: 5, limit: 1200, seeds: seeds})
     Qt.callLater(function() { finderField.forceActiveFocus() })
   }
 
@@ -79,7 +81,10 @@ Item {
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i]
       var score = fuzzyScore(row.relative, needle)
-      if (score > -1000000) scored.push({path: row.path, name: row.name, relative: row.relative, score: score})
+      if (row.source === "bookmark") score += 500
+      else if (row.source === "recent") score += 300
+      else if (row.source === "zoxide") score += 180
+      if (score > -1000000) scored.push({path: row.path, name: row.name, relative: row.relative, source: row.source || "scan", score: score})
     }
     scored.sort(function(a, b) {
       if (a.score !== b.score) return b.score - a.score
@@ -190,7 +195,8 @@ Item {
             anchors.left: parent.left; anchors.right: parent.right
             anchors.leftMargin: Style.space(10); anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
-            text: "󰉋  " + root.displayPath(modelData)
+            text: (modelData.source === "bookmark" ? "󰃀" : (modelData.source === "recent" ? "󰋚" : "󰉋")) + "  "
+                  + (modelData.source === "scan" ? root.displayPath(modelData) : modelData.path.replace(root.homePath, "~"))
             color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
             font.family: Style.font.family; font.pixelSize: Style.font.body
             elide: Text.ElideMiddle

@@ -11,6 +11,7 @@ library, and no copying of user media.
 - Python 3.11 or newer (standard library only)
 - `ffmpeg` and `ffprobe`
 - `inotify-tools`, `gio`, `xdg-open`, and `wl-copy`
+- Optional: `zoxide` contributes frecency-ranked directories to the jumper
 - Optional: ImageMagick improves fallback decoding for formats FFmpeg rejects
 
 These are present on a standard current Omarchy installation. The helper has
@@ -79,15 +80,22 @@ After editing user Hyprland bindings, run `hyprctl reload` and
 | `Enter` or `o` | Open folder; Quick Look media; open other files |
 | `Space` | Open Quick Look |
 | `gg` / `G` | Select first / last item |
+| `n` / `N` | Next / previous item in strict sort order |
+| `zz` / `zt` / `zb` | Place the selected tile at center / top / bottom |
 | `Ctrl+U` / `Ctrl+D` | Scroll half a page |
 | `Backspace` | Parent directory |
 | `H` / `L` | Back / forward |
 | `gh` / `gp` | Home / Pictures |
 | `/` or `Ctrl+F` | Filter current folder |
-| `c` | Open the fuzzy directory jumper |
+| `c` | Open the fuzzy recent/bookmark/directory jumper |
+| `b` | Bookmark or unbookmark the current directory |
 | `Ctrl+L` | Edit location |
 | `.` or `Ctrl+H` | Toggle hidden files |
 | `y` | Copy selected path |
+| `x` / `v` / `V` | Toggle mark / visual mark / mark a range |
+| `Y` / `X` / `p` | Stage a copy / stage a move / paste into this folder |
+| `a` / `:` / `,` | File actions / all commands / view and sort palette |
+| `i` | Open media in Quick Look with its information panel |
 | `r` / `R` | Rename / refresh |
 | `d` | Move to Trash after confirmation |
 | `s` | Show or hide the sidebar |
@@ -104,10 +112,11 @@ Quick Look adds these controls:
 | --- | --- |
 | `q` or `Escape` | Close Quick Look |
 | `Space` | Close an image, or play/pause a video |
-| `[` / `]` or `Shift+Left` / `Shift+Right` | Previous / next media in current sort order |
-| `Left` / `Right` or `h` / `l` | Previous/next image at any zoom; seek video ±5 seconds |
-| `j` / `k` / `l` on video | Seek −10 seconds / play-pause / seek +5 seconds |
+| `h` / `l`, `[` / `]`, or `Shift+Left` / `Shift+Right` | Previous / next media in current sort order |
+| `Left` / `Right` | Previous/next image; seek video ±5 seconds |
+| `j` / `k` on video | Volume down / up |
 | `m` | Mute/unmute video |
+| `i` / `o` / `y` | Toggle information / open externally / copy path |
 | `f` or `0` | Fit image to the preview |
 | `1` | Show the image at true 100% |
 | `+` / `-` | Zoom image in/out |
@@ -128,10 +137,12 @@ An active folder filter always keeps its input visible and shows the term in
 the empty state. Navigating to another directory clears the filter so it cannot
 silently hide that directory's contents.
 
-Press `c` for a native fzf-style directory jumper. It asynchronously scans a
-bounded five-level directory tree under Home (or the current non-Home root),
-streams results progressively, fuzzy-ranks as you type, and supports arrows or
-`Ctrl+N`/`Ctrl+P` plus Enter. The scan runs only when the jumper is opened.
+Press `c` for a native fzf-style directory jumper. Bookmarks and recently used
+directories are ranked first; installed `zoxide` history is folded in as an
+optional frecency source. It also asynchronously scans a bounded five-level
+tree under Home (or the current non-Home root), streams results progressively,
+fuzzy-ranks as you type, and supports arrows or `Ctrl+N`/`Ctrl+P` plus Enter.
+The filesystem scan runs only when the jumper is opened.
 
 ## Window and settings
 
@@ -151,9 +162,11 @@ persist between launches.
 The QML panel runs inside the existing `omarchy-shell` and owns a supported
 Quickshell `FloatingWindow`; it is not a duplicate shell. A small persistent
 Python helper streams directory entries and performs probing/thumbnail work on
-three bounded worker threads. Only tiles inside a one-viewport overscan region
-exist as QML objects, so directories containing thousands of files do not
-instantiate thousands of image delegates.
+three bounded worker threads. Directory generations cancel obsolete queued
+thumbnail work when the user moves elsewhere. Only tiles inside a one-viewport
+overscan region exist as QML objects, and the virtual model is reconciled in
+place instead of recreated while scrolling, so directories containing
+thousands of files do not instantiate thousands of image delegates.
 
 Disposable thumbnails are stored under
 `$XDG_CACHE_HOME/quattro-files/thumbs` (falling back to

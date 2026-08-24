@@ -17,6 +17,9 @@ BorderSurface {
   property var places: []
   property var backHistory: []
   property var forwardHistory: []
+  property var directoryViews: ({})
+  property string restoreDirectory: ""
+  property real restoreScrollY: 0
   property int directorySerial: 0
   property int selectedIndex: 0
   property string selectedPath: ""
@@ -48,10 +51,20 @@ BorderSurface {
   property bool settingsOpen: false
   property bool helpOpen: false
   property string pendingVimKey: ""
+  property var markedPaths: ({})
+  property int markAnchor: -1
+  property bool markMode: false
   property var actionRow: null
+  property var trashPaths: []
+  property var clipboardPaths: []
+  property string clipboardMode: ""
+  property string paletteMode: ""
+  property var recentDirectories: []
+  property var bookmarkedDirectories: []
   readonly property real effectiveSidebarWidth: sidebarVisible ? Math.max(Style.space(150), Math.min(Style.space(320), sidebarWidth)) : 0
   readonly property string homePath: Quickshell.env("HOME")
   readonly property var selectedRow: selectedIndex >= 0 && selectedIndex < rows.length ? rows[selectedIndex] : null
+  readonly property int markedCount: Object.keys(markedPaths).length
 
   signal dismissRequested()
   signal watchRequested(string path)
@@ -75,6 +88,7 @@ BorderSurface {
 
   function deactivate() {
     quickLook.close()
+    rememberCurrentView()
     saveState()
     contextOpen = false
     renameOpen = false
@@ -96,6 +110,7 @@ BorderSurface {
   function navigate(path, recordHistory) {
     var target = String(path || "")
     if (!target || !backend || !backend.backendReady) { deferredPath = target; return }
+    rememberCurrentView()
     // Filters are directory-local. Keeping one while navigating makes a
     // populated destination look empty and hides why it happened.
     filterText = ""
@@ -111,10 +126,21 @@ BorderSurface {
     rows = []
     selectedIndex = 0
     selectedPath = ""
+    // Canceled helper jobs intentionally emit no terminal event. Drop their
+    // UI bookkeeping here so revisiting a directory can request them again.
+    thumbPending = ({})
+    markedPaths = ({})
+    markAnchor = -1
+    markMode = false
     loading = true
     enumerationDone = false
     statusMessage = ""
     contextOpen = false
+    restoreDirectory = target
+    var savedView = directoryViews[target]
+    restoreScrollY = savedView ? Number(savedView.scrollY || 0) : 0
+    if (savedView && savedView.selectedPath) selectedPath = String(savedView.selectedPath)
+    backend.send({command: "generation", generation: directorySerial})
     backend.send({command: "list", serial: directorySerial, path: target, hidden: showHidden})
   }
 
@@ -151,10 +177,44 @@ BorderSurface {
 
   function goParent() { navigate(BrowserModel.parentPath(currentDirectory), true) }
 
+  function rememberCurrentView() {
+    if (!currentDirectory) return
+    var copy = ({})
+    var keys = Object.keys(directoryViews)
+    for (var i = Math.max(0, keys.length - 79); i < keys.length; i++) copy[keys[i]] = directoryViews[keys[i]]
+    copy[currentDirectory] = {selectedPath: selectedRow ? selectedRow.path : selectedPath,
+                              scrollY: masonry.scrollPosition, touched: Date.now()}
+    directoryViews = copy
+  }
+
   function openDirectoryFinder() {
     var rootPath = currentDirectory.indexOf(homePath + "/") === 0 || currentDirectory === homePath
       ? homePath : currentDirectory
-    directoryFinder.show(rootPath)
+    var seeds = []
+    for (var b = 0; b < bookmarkedDirectories.length; b++) seeds.push({path:bookmarkedDirectories[b], source:"bookmark"})
+    for (var r = 0; r < recentDirectories.length; r++) seeds.push({path:recentDirectories[r], source:"recent"})
+    directoryFinder.show(rootPath, seeds)
+  }
+
+  function recordRecent(path) {
+    var value = String(path || "")
+    if (!value) return
+    var next = [value]
+    for (var i = 0; i < recentDirectories.length && next.length < 40; i++)
+      if (recentDirectories[i] !== value) next.push(recentDirectories[i])
+    recentDirectories = next
+  }
+
+  function toggleBookmark() {
+    var next = [], found = false
+    for (var i = 0; i < bookmarkedDirectories.length; i++) {
+      if (bookmarkedDirectories[i] === currentDirectory) found = true
+      else next.push(bookmarkedDirectories[i])
+    }
+    if (!found) next.unshift(currentDirectory)
+    bookmarkedDirectories = next
+    saveState()
+    toast(found ? "Directory bookmark removed" : "Directory bookmarked")
   }
 
   function handleMessage(message) {
@@ -170,10 +230,20 @@ BorderSurface {
       if (state.sortMode) sortMode = String(state.sortMode)
       sortDescending = state.sortDescending === true
       showHidden = state.showHidden === true
+      if (state.directoryViews && typeof state.directoryViews === "object") directoryViews = state.directoryViews
+      if (Array.isArray(state.recentDirectories)) recentDirectories = state.recentDirectories
+      if (Array.isArray(state.bookmarkedDirectories)) bookmarkedDirectories = state.bookmarkedDirectories
       deferredPath = String(state.lastDirectory || "")
       initialNavigate()
     } else if (message.serial === directorySerial && message.event === "begin") {
       currentDirectory = String(message.path)
+      recordRecent(currentDirectory)
+      var restoredView = directoryViews[currentDirectory]
+      if (restoredView) {
+        restoreDirectory = currentDirectory
+        restoreScrollY = Number(restoredView.scrollY || 0)
+        selectedPath = String(restoredView.selectedPath || selectedPath)
+      }
       deferredPath = ""
       watchRequested(currentDirectory)
     } else if (message.serial === directorySerial && message.event === "entry") {
@@ -199,6 +269,10 @@ BorderSurface {
     } else if (message.event === "action") {
       if (!message.ok) toast(message.message || "Action failed")
       else if (message.operation === "rename") { renameOpen = false; refresh(false); toast("Renamed") }
+      else if (message.operation === "transfer") {
+        if (message.mode === "move") { clipboardPaths = []; clipboardMode = "" }
+        clearMarks(); refresh(true); toast(message.count + (message.mode === "move" ? " moved" : " copied"))
+      }
     }
   }
 
@@ -216,7 +290,12 @@ BorderSurface {
     if (keep) for (var i = 0; i < rows.length; i++) if (rows[i].path === keep) { found = i; break }
     selectedIndex = rows.length ? (found >= 0 ? found : Math.max(0, Math.min(selectedIndex, rows.length - 1))) : 0
     selectedPath = rows.length ? rows[selectedIndex].path : ""
-    Qt.callLater(function() { masonry.ensureVisible(root.selectedIndex) })
+    Qt.callLater(function() {
+      if (root.restoreDirectory === root.currentDirectory) {
+        masonry.restoreView(root.selectedIndex, root.restoreScrollY)
+        root.restoreDirectory = ""
+      } else masonry.ensureVisible(root.selectedIndex)
+    })
   }
 
   function applyThumbnail(message) {
@@ -245,7 +324,7 @@ BorderSurface {
     for (var key in thumbPending) next[key] = thumbPending[key]
     next[requestId] = path
     thumbPending = next
-    backend.send({command: "thumbnail", requestId: requestId, path: path, kind: kind, width: 640})
+    backend.send({command: "thumbnail", requestId: requestId, path: path, kind: kind, width: 640, generation: directorySerial})
   }
 
   function markThumbnailFailed(path) {
@@ -269,29 +348,44 @@ BorderSurface {
     if (!rows.length) return
     selectedIndex = Math.max(0, Math.min(index, rows.length - 1))
     selectedPath = rows[selectedIndex].path
+    if (markMode) markRange(selectedIndex)
     masonry.ensureVisible(selectedIndex)
     contextOpen = false
   }
 
-  function moveHorizontal(delta) { select(selectedIndex + delta) }
+  function moveGeometric(dx, dy) {
+    var next = masonry.geometricNeighbor(selectedIndex, dx, dy)
+    if (next >= 0) select(next)
+  }
 
-  function moveVertical(delta) {
-    if (!masonry.layoutRows.length || selectedIndex >= masonry.layoutRows.length) return
-    var current = masonry.layoutRows[selectedIndex]
-    var best = -1, score = Number.MAX_VALUE
-    var cx = current.x + current.width / 2
-    var cy = current.y + current.height / 2
-    for (var i = 0; i < masonry.layoutRows.length; i++) {
-      if (i === selectedIndex) continue
-      var candidate = masonry.layoutRows[i]
-      var tx = candidate.x + candidate.width / 2
-      var ty = candidate.y + candidate.height / 2
-      var dy = ty - cy
-      if ((delta < 0 && dy >= -1) || (delta > 0 && dy <= 1)) continue
-      var scoreNow = Math.abs(dy) + Math.abs(tx - cx) * 1.7
-      if (scoreNow < score) { score = scoreNow; best = i }
-    }
-    if (best >= 0) select(best)
+  function toggleMark(index) {
+    if (index < 0 || index >= rows.length) return
+    var next = ({}), path = rows[index].path
+    for (var key in markedPaths) next[key] = markedPaths[key]
+    if (next[path]) delete next[path]
+    else next[path] = true
+    markedPaths = next
+    if (markAnchor < 0) markAnchor = index
+  }
+
+  function markRange(index) {
+    if (markAnchor < 0) markAnchor = selectedIndex
+    var next = ({})
+    for (var key in markedPaths) next[key] = markedPaths[key]
+    var start = Math.min(markAnchor, index), end = Math.max(markAnchor, index)
+    for (var i = start; i <= end; i++) next[rows[i].path] = true
+    markedPaths = next
+  }
+
+  function clearMarks() { markedPaths = ({}); markAnchor = -1; markMode = false }
+
+  function operationRows() {
+    var result = []
+    var paths = Object.keys(markedPaths)
+    if (paths.length) {
+      for (var i = 0; i < rows.length; i++) if (markedPaths[rows[i].path]) result.push(rows[i])
+    } else if (selectedRow) result.push(selectedRow)
+    return result
   }
 
   function activateSelected() {
@@ -331,16 +425,108 @@ BorderSurface {
   function requestTrash(row) {
     if (!row) return
     actionRow = row
+    trashPaths = [row.path]
     trashDialog.message = "Move “" + row.name + "” to Trash?"
     trashOpen = true
     contextOpen = false
   }
 
   function confirmTrash() {
-    if (!actionRow) return
-    trashProc.command = ["gio", "trash", "--", actionRow.path]
+    if (!trashPaths.length) return
+    trashProc.command = ["gio", "trash", "--"].concat(trashPaths)
     trashProc.running = true
     trashOpen = false
+  }
+
+  function requestTrashOperation() {
+    var selected = operationRows()
+    if (!selected.length) return
+    trashPaths = selected.map(function(row) { return row.path })
+    trashDialog.message = selected.length === 1 ? "Move “" + selected[0].name + "” to Trash?"
+                                                : "Move " + selected.length + " marked items to Trash?"
+    trashOpen = true
+  }
+
+  function stageTransfer(mode) {
+    var selected = operationRows()
+    clipboardPaths = selected.map(function(row) { return row.path })
+    clipboardMode = mode
+    toast(selected.length + (mode === "move" ? " cut" : " copied") + " for transfer")
+  }
+
+  function pasteTransfer() {
+    if (!clipboardPaths.length) { toast("Transfer clipboard is empty"); return }
+    backend.send({command: "action", operation: "transfer", requestId: backend.nextRequestId("transfer"),
+                  mode: clipboardMode, paths: clipboardPaths, destination: currentDirectory})
+    toast(clipboardMode === "move" ? "Moving…" : "Copying…")
+  }
+
+  function actionCommands() {
+    return [
+      {id:"open", key:"o", label:"Open selection", detail:"Folder, Quick Look, or default application", enabled: !!selectedRow},
+      {id:"external", key:"O", label:"Open with default application", detail:selectedRow ? selectedRow.name : "", enabled: !!selectedRow},
+      {id:"copy-path", key:"y", label:"Copy path", detail:selectedRow ? selectedRow.path : "", enabled: !!selectedRow},
+      {id:"rename", key:"r", label:"Rename", detail:"Single selected item", enabled: markedCount === 0 && !!selectedRow},
+      {id:"copy-files", key:"Y", label:"Copy files", detail:"Stage selected or marked items for transfer", enabled: !!selectedRow},
+      {id:"move-files", key:"X", label:"Cut / move files", detail:"Stage selected or marked items for transfer", enabled: !!selectedRow},
+      {id:"paste", key:"p", label:"Paste into this folder", detail:clipboardPaths.length ? clipboardPaths.length + " staged" : "Clipboard empty", enabled: clipboardPaths.length > 0},
+      {id:"trash", key:"d", label:"Move to Trash", detail:markedCount ? markedCount + " marked items" : (selectedRow ? selectedRow.name : ""), enabled: !!selectedRow}
+    ]
+  }
+
+  function viewCommands() {
+    return [
+      {id:"sort-name", key:"sn", label:"Sort by name", detail:"Natural filename order"},
+      {id:"sort-modified", key:"sm", label:"Sort by modified", detail:"Modification timestamp"},
+      {id:"sort-size", key:"ss", label:"Sort by size", detail:"File size"},
+      {id:"sort-type", key:"st", label:"Sort by type", detail:"MIME / file kind"},
+      {id:"reverse-sort", key:"sr", label:"Reverse sort", detail:sortDescending ? "Currently descending" : "Currently ascending"},
+      {id:"toggle-sidebar", key:"s", label:"Toggle sidebar", detail:sidebarVisible ? "Shown" : "Hidden"},
+      {id:"toggle-labels", key:"fl", label:"Toggle filenames", detail:showLabels ? "Shown" : "Hidden"},
+      {id:"toggle-hidden", key:".", label:"Toggle hidden files", detail:showHidden ? "Shown" : "Hidden"},
+      {id:"bookmark", key:"b", label:"Toggle directory bookmark", detail:bookmarkedDirectories.indexOf(currentDirectory) >= 0 ? "Bookmarked" : currentDirectory},
+      {id:"center", key:"zz", label:"Center selection", detail:"Keep the cursor anchored"},
+      {id:"settings", key:"S", label:"Browser settings", detail:"Sizing and appearance"}
+    ]
+  }
+
+  function allCommands() { return actionCommands().concat([
+    {id:"finder", key:"c", label:"Jump to directory", detail:"Fuzzy, recent, bookmarks, and filesystem"},
+    {id:"search", key:"/", label:"Filter current folder", detail:"Immediate filename filter"},
+    {id:"info", key:"i", label:"Preview with information", detail:"Open selected media and show metadata", enabled:!!selectedRow && (selectedRow.kind === "image" || selectedRow.kind === "video")},
+    {id:"clear-marks", key:"Esc", label:"Clear marks", detail:markedCount + " marked", enabled:markedCount > 0}
+  ]).concat(viewCommands()) }
+
+  function showPalette(mode) {
+    paletteMode = mode
+    commandPalette.show(mode === "actions" ? "FILE ACTIONS" : (mode === "view" ? "VIEW & SORT" : "COMMANDS"),
+                        mode === "actions" ? actionCommands() : (mode === "view" ? viewCommands() : allCommands()))
+  }
+
+  function setSort(mode) { sortMode = mode; sortDescending = false; rebuildRows(); saveState() }
+
+  function executeCommand(command) {
+    if (command === "open") activateSelected()
+    else if (command === "external") openDefault(selectedRow)
+    else if (command === "copy-path") copyPath(selectedRow)
+    else if (command === "rename") beginRename(selectedRow)
+    else if (command === "copy-files") stageTransfer("copy")
+    else if (command === "move-files") stageTransfer("move")
+    else if (command === "paste") pasteTransfer()
+    else if (command === "trash") requestTrashOperation()
+    else if (command === "finder") openDirectoryFinder()
+    else if (command === "search") { searchOpen = true; Qt.callLater(function() { searchField.forceActiveFocus() }) }
+    else if (command === "info") { quickLook.show(selectedIndex); quickLook.infoVisible = true }
+    else if (command === "clear-marks") clearMarks()
+    else if (command.indexOf("sort-") === 0) setSort(command.substring(5))
+    else if (command === "reverse-sort") { sortDescending = !sortDescending; rebuildRows(); saveState() }
+    else if (command === "toggle-sidebar") { sidebarVisible = !sidebarVisible; saveState() }
+    else if (command === "toggle-labels") { showLabels = !showLabels; saveState() }
+    else if (command === "toggle-hidden") { showHidden = !showHidden; refresh(true) }
+    else if (command === "bookmark") toggleBookmark()
+    else if (command === "center") masonry.centerSelected(selectedIndex, "center")
+    else if (command === "settings") settingsOpen = true
+    Qt.callLater(function() { if (!quickLook.opened && !searchOpen && !renameOpen) keyCatcher.forceActiveFocus() })
   }
 
   function showContext(index, sceneX, sceneY) {
@@ -362,7 +548,9 @@ BorderSurface {
     backend.send({command: "action", operation: "state", requestId: backend.nextRequestId("state"), value: {
       lastDirectory: currentDirectory, thumbnailWidth: thumbnailWidth, sortMode: sortMode,
       gapSize: gapSize, sidebarWidth: sidebarWidth, sidebarVisible: sidebarVisible, showLabels: showLabels,
-      foldersFirst: foldersFirst, sortDescending: sortDescending, showHidden: showHidden
+      foldersFirst: foldersFirst, sortDescending: sortDescending, showHidden: showHidden,
+      directoryViews: directoryViews, recentDirectories: recentDirectories,
+      bookmarkedDirectories: bookmarkedDirectories
     }})
   }
 
@@ -395,7 +583,7 @@ BorderSurface {
   Process {
     id: trashProc
     onExited: function(exitCode) {
-      if (exitCode === 0) { root.toast("Moved to Trash"); root.refresh(false) }
+      if (exitCode === 0) { root.toast(root.trashPaths.length + " moved to Trash"); root.clearMarks(); root.trashPaths = []; root.refresh(false) }
       else root.toast("Could not move item to Trash")
       keyCatcher.forceActiveFocus()
     }
@@ -429,13 +617,18 @@ BorderSurface {
         else if (event.key === Qt.Key_BracketLeft || (shifted && event.key === Qt.Key_Left)) quickLook.move(-1)
         else if (event.key === Qt.Key_BracketRight || (shifted && event.key === Qt.Key_Right)) quickLook.move(1)
         else if (event.key === Qt.Key_Space) quickLook.togglePlayback()
-        else if (quickLook.isVideo && (event.key === Qt.Key_Left || event.text === "h")) quickLook.seekRelative(-5000)
-        else if (quickLook.isVideo && (event.key === Qt.Key_Right || event.text === "l")) quickLook.seekRelative(5000)
-        else if (quickLook.isVideo && event.text === "j") quickLook.seekRelative(-10000)
-        else if (quickLook.isVideo && event.text === "k") quickLook.togglePlayback()
+        else if (event.text === "h") quickLook.move(-1)
+        else if (event.text === "l") quickLook.move(1)
+        else if (quickLook.isVideo && event.key === Qt.Key_Left) quickLook.seekRelative(-5000)
+        else if (quickLook.isVideo && event.key === Qt.Key_Right) quickLook.seekRelative(5000)
+        else if (quickLook.isVideo && event.text === "j") quickLook.adjustVolume(-.05)
+        else if (quickLook.isVideo && event.text === "k") quickLook.adjustVolume(.05)
         else if (quickLook.isVideo && event.text === "m") quickLook.toggleMute()
-        else if (!quickLook.isVideo && (event.key === Qt.Key_Left || event.text === "h")) quickLook.move(-1)
-        else if (!quickLook.isVideo && (event.key === Qt.Key_Right || event.text === "l")) quickLook.move(1)
+        else if (!quickLook.isVideo && event.key === Qt.Key_Left) quickLook.move(-1)
+        else if (!quickLook.isVideo && event.key === Qt.Key_Right) quickLook.move(1)
+        else if (event.text === "i") quickLook.toggleInfo()
+        else if (event.text === "o") quickLook.openExternal()
+        else if (event.text === "y") { quickLook.copyCurrentPath(); root.toast("Path copied") }
         else if (!quickLook.isVideo && (event.text === "f" || event.text === "0")) quickLook.fitImage()
         else if (!quickLook.isVideo && event.text === "1") quickLook.actualSize()
         else if (!quickLook.isVideo && (event.text === "+" || event.text === "=")) quickLook.adjustZoom(1.25)
@@ -446,20 +639,25 @@ BorderSurface {
       var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
       var alt = (event.modifiers & Qt.AltModifier) !== 0
       var shiftedBrowser = (event.modifiers & Qt.ShiftModifier) !== 0
-      if (root.pendingVimKey === "g") {
+      if (root.pendingVimKey) {
+        var chord = root.pendingVimKey
         root.pendingVimKey = ""
         vimChordTimer.stop()
-        if (event.text === "g") root.select(0)
-        else if (event.text === "h") root.navigate(root.homePath, true)
-        else if (event.text === "p") {
+        if (chord === "g" && event.text === "g") root.select(0)
+        else if (chord === "g" && event.text === "h") root.navigate(root.homePath, true)
+        else if (chord === "g" && event.text === "p") {
           for (var pi = 0; pi < root.places.length; pi++) if (root.places[pi].name === "Pictures") { root.navigate(root.places[pi].path, true); break }
-        } else return
+        } else if (chord === "z" && event.text === "z") masonry.centerSelected(root.selectedIndex, "center")
+        else if (chord === "z" && event.text === "t") masonry.centerSelected(root.selectedIndex, "top")
+        else if (chord === "z" && event.text === "b") masonry.centerSelected(root.selectedIndex, "bottom")
+        else return
         event.accepted = true
         return
       }
       if (event.key === Qt.Key_Escape) {
         if (root.contextOpen || root.sortOpen || root.settingsOpen) { root.contextOpen = false; root.sortOpen = false; root.settingsOpen = false }
         else if (root.searchOpen || root.filterText) { root.searchOpen = false; root.filterText = ""; rebuildTimer.restart() }
+        else if (root.markedCount) root.clearMarks()
         else root.dismissRequested()
       } else if (event.key === Qt.Key_F11) {
         root.fullscreenToggleRequested()
@@ -485,25 +683,50 @@ BorderSurface {
       } else if (alt && event.key === Qt.Key_Left) root.goBack()
       else if (alt && event.key === Qt.Key_Right) root.goForward()
       else if (event.key === Qt.Key_Backspace) root.goParent()
-      else if (event.key === Qt.Key_Left || event.text === "h") root.moveHorizontal(-1)
-      else if (event.key === Qt.Key_Right || event.text === "l") root.moveHorizontal(1)
-      else if (event.key === Qt.Key_Up || event.text === "k") root.moveVertical(-1)
-      else if (event.key === Qt.Key_Down || event.text === "j") root.moveVertical(1)
-      else if (event.key === Qt.Key_PageUp) { masonry.page(-1); root.moveVertical(-1) }
-      else if (event.key === Qt.Key_PageDown) { masonry.page(1); root.moveVertical(1) }
+      else if (event.key === Qt.Key_Left || event.text === "h") root.moveGeometric(-1, 0)
+      else if (event.key === Qt.Key_Right || event.text === "l") root.moveGeometric(1, 0)
+      else if (event.key === Qt.Key_Up || event.text === "k") root.moveGeometric(0, -1)
+      else if (event.key === Qt.Key_Down || event.text === "j") root.moveGeometric(0, 1)
+      else if (event.key === Qt.Key_PageUp) { masonry.page(-1); root.moveGeometric(0, -1) }
+      else if (event.key === Qt.Key_PageDown) { masonry.page(1); root.moveGeometric(0, 1) }
       else if (event.key === Qt.Key_Home) root.select(0)
       else if (event.key === Qt.Key_End || event.text === "G") root.select(root.rows.length - 1)
       else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.text === "o") root.activateSelected()
       else if (event.key === Qt.Key_Space) { if (root.selectedRow && (root.selectedRow.kind === "image" || root.selectedRow.kind === "video")) quickLook.show(root.selectedIndex) }
       else if (event.key === Qt.Key_F2) root.beginRename(root.selectedRow)
       else if (event.text === "g") { root.pendingVimKey = "g"; vimChordTimer.restart() }
+      else if (event.text === "z") { root.pendingVimKey = "z"; vimChordTimer.restart() }
+      else if (event.text === "n") root.select(Math.min(root.rows.length - 1, root.selectedIndex + 1))
+      else if (event.text === "N") root.select(Math.max(0, root.selectedIndex - 1))
+      else if (event.text === "x") root.toggleMark(root.selectedIndex)
+      else if (event.text === "v") {
+        root.markMode = !root.markMode
+        if (root.markMode) {
+          root.markAnchor = root.selectedIndex
+          if (root.selectedRow && !root.markedPaths[root.selectedRow.path]) root.toggleMark(root.selectedIndex)
+        }
+      }
+      else if (event.text === "V") { if (root.markAnchor < 0) root.markAnchor = root.selectedIndex; root.markMode = true; root.markRange(root.selectedIndex) }
       else if (event.text === "H") root.goBack()
       else if (event.text === "L") root.goForward()
       else if (event.text === "y") root.copyPath(root.selectedRow)
       else if (event.text === "r") root.beginRename(root.selectedRow)
       else if (event.text === "R") root.refresh(true)
-      else if (event.text === "d") root.requestTrash(root.selectedRow)
+      else if (event.text === "d") root.requestTrashOperation()
+      else if (event.text === "i") {
+        if (root.selectedRow && (root.selectedRow.kind === "image" || root.selectedRow.kind === "video")) {
+          quickLook.show(root.selectedIndex)
+          quickLook.infoVisible = true
+        }
+      }
+      else if (event.text === "a") root.showPalette("actions")
+      else if (event.text === ":") root.showPalette("all")
+      else if (event.text === ",") root.showPalette("view")
+      else if (event.text === "Y") root.stageTransfer("copy")
+      else if (event.text === "X") root.stageTransfer("move")
+      else if (event.text === "p") root.pasteTransfer()
       else if (event.text === "c") root.openDirectoryFinder()
+      else if (event.text === "b") root.toggleBookmark()
       else if (event.text === ".") { root.showHidden = !root.showHidden; root.refresh(true) }
       else if (event.text === "s") { root.sidebarVisible = !root.sidebarVisible; root.saveState() }
       else if (event.text === "S") root.settingsOpen = !root.settingsOpen
@@ -677,9 +900,11 @@ BorderSurface {
 
         MasonryView {
           id: masonry
-          anchors.fill: parent; anchors.margins: Style.spacing.md
+          anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: statusBar.top
+          anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; anchors.topMargin: Style.spacing.md
           rows: root.rows
           selectedIndex: root.selectedIndex
+          markedPaths: root.markedPaths
           targetWidth: root.thumbnailWidth
           gap: root.gapSize
           showLabels: root.showLabels
@@ -687,6 +912,29 @@ BorderSurface {
           onActivateRequested: function(index) { root.select(index); root.activateSelected() }
           onContextRequested: function(index, sceneX, sceneY) { root.showContext(index, sceneX, sceneY) }
           onThumbnailRequested: function(path, kind) { root.requestThumbnail(path, kind) }
+        }
+
+        Rectangle {
+          id: statusBar
+          anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+          height: Style.space(30)
+          color: Util.alpha(Color.menu.text, .025)
+          Rectangle { anchors.top: parent.top; width: parent.width; height: Math.max(1, Style.normalBorderWidth); color: Color.menu.border; opacity: .25 }
+          Text {
+            anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
+            text: {
+              if (!root.selectedRow) return root.loading ? "reading…" : "0 items"
+              var row = root.selectedRow
+              var position = (root.selectedIndex + 1) + "/" + root.rows.length
+              var marked = root.markedCount ? "   " + root.markedCount + " marked" : ""
+              var dimensions = row.width ? "   " + row.width + "×" + row.height : ""
+              return position + marked + "   " + row.name + dimensions + "   " + BrowserModel.formatBytes(row.size || 0)
+            }
+            color: Color.menu.text; opacity: .58
+            font.family: Style.font.family; font.pixelSize: Style.font.caption
+            elide: Text.ElideMiddle
+          }
         }
 
         Column {
@@ -889,6 +1137,13 @@ BorderSurface {
     backend: root.backend
     homePath: root.homePath
     onChosen: function(path) { root.navigate(path, true); keyCatcher.forceActiveFocus() }
+    onCloseRequested: keyCatcher.forceActiveFocus()
+  }
+
+  CommandPalette {
+    id: commandPalette
+    anchors.fill: parent
+    onInvoked: function(command) { root.executeCommand(command) }
     onCloseRequested: keyCatcher.forceActiveFocus()
   }
 

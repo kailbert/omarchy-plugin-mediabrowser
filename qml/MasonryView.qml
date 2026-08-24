@@ -13,6 +13,8 @@ Item {
   property var layoutRows: []
   property real contentHeight: 0
   property bool layoutBusy: false
+  property var markedPaths: ({})
+  readonly property real scrollPosition: flick.contentY
 
   signal selectRequested(int index)
   signal activateRequested(int index)
@@ -51,17 +53,40 @@ Item {
     if (!layoutRows) return
     var top = Math.max(0, flick.contentY - flick.height)
     var bottom = flick.contentY + flick.height * 2
-    visibleModel.clear()
+    var wanted = []
+    var center = flick.contentY + flick.height / 2
     for (var i = 0; i < layoutRows.length; i++) {
       var item = layoutRows[i]
       if (item.y + item.height < top || item.y > bottom) continue
       var row = item.row
-      visibleModel.append({
+      wanted.push({
         displayIndex: item.index, tileX: item.x, tileY: item.y, tileWidth: item.width,
         tileHeight: item.height, mediaHeight: item.mediaHeight, labelHeight: item.labelHeight, filePath: String(row.path || ""),
         fileName: String(row.name || ""), kind: String(row.kind || "file"), mime: String(row.mime || ""),
-        thumbnail: String(row.thumbnail || ""), duration: Number(row.duration || 0), broken: row.broken === true
+        thumbnail: String(row.thumbnail || ""), duration: Number(row.duration || 0), broken: row.broken === true,
+        distance: Math.abs(item.y + item.height / 2 - center)
       })
+    }
+    wanted.sort(function(a, b) { return a.distance - b.distance })
+
+    // Reconcile in place so scrolling retains overlapping delegates and their
+    // textures instead of destroying the entire visible viewport every frame.
+    var keep = ({})
+    for (var w = 0; w < wanted.length; w++) keep[String(wanted[w].displayIndex)] = true
+    for (var old = visibleModel.count - 1; old >= 0; old--)
+      if (!keep[String(visibleModel.get(old).displayIndex)]) visibleModel.remove(old)
+    var existing = ({})
+    for (var e = 0; e < visibleModel.count; e++) existing[String(visibleModel.get(e).displayIndex)] = e
+    var fields = ["tileX","tileY","tileWidth","tileHeight","mediaHeight","labelHeight","filePath","fileName","kind","mime","thumbnail","duration","broken"]
+    for (var n = 0; n < wanted.length; n++) {
+      var value = wanted[n]
+      var key = String(value.displayIndex)
+      if (existing[key] === undefined) {
+        visibleModel.append(value)
+      } else {
+        var modelIndex = existing[key]
+        for (var f = 0; f < fields.length; f++) visibleModel.setProperty(modelIndex, fields[f], value[fields[f]])
+      }
     }
   }
 
@@ -70,6 +95,41 @@ Item {
     var item = layoutRows[index]
     if (item.y < flick.contentY) flick.contentY = item.y
     else if (item.y + item.height > flick.contentY + flick.height) flick.contentY = item.y + item.height - flick.height
+  }
+
+  function restoreView(index, scrollY) {
+    if (index < 0 || index >= layoutRows.length) return
+    flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height), Number(scrollY || 0)))
+    ensureVisible(index)
+    rebuildVisible()
+  }
+
+  function centerSelected(index, alignment) {
+    if (index < 0 || index >= layoutRows.length) return
+    var item = layoutRows[index]
+    var ratio = alignment === "top" ? 0 : (alignment === "bottom" ? 1 : .5)
+    flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height), item.y + item.height / 2 - flick.height * ratio))
+  }
+
+  function geometricNeighbor(index, dx, dy) {
+    if (index < 0 || index >= layoutRows.length) return -1
+    var current = layoutRows[index]
+    var cx = current.x + current.width / 2
+    var cy = current.y + current.height / 2
+    var best = -1, bestScore = Number.MAX_VALUE
+    for (var i = 0; i < layoutRows.length; i++) {
+      if (i === index) continue
+      var candidate = layoutRows[i]
+      var tx = candidate.x + candidate.width / 2
+      var ty = candidate.y + candidate.height / 2
+      var rx = tx - cx, ry = ty - cy
+      if ((dx < 0 && rx >= -1) || (dx > 0 && rx <= 1) || (dy < 0 && ry >= -1) || (dy > 0 && ry <= 1)) continue
+      var primary = dx ? Math.abs(rx) : Math.abs(ry)
+      var cross = dx ? Math.abs(ry) : Math.abs(rx)
+      var score = primary + cross * 1.8
+      if (score < bestScore) { bestScore = score; best = i }
+    }
+    return best
   }
 
   function page(delta) {
@@ -110,6 +170,7 @@ Item {
         thumbnail: model.thumbnail
         duration: model.duration
         broken: model.broken
+        marked: root.markedPaths[model.filePath] === true
         x: model.tileX
         y: model.tileY
         width: model.tileWidth

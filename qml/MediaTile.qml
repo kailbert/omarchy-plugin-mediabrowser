@@ -16,6 +16,7 @@ BorderSurface {
   required property real duration
   required property bool broken
   property bool selected: false
+  property bool marked: false
   property real mediaHeight: Math.max(1, height - labelHeight)
   property real labelHeight: Style.space(31)
 
@@ -144,6 +145,19 @@ BorderSurface {
     borderSpec: root.selected
       ? Border.withWidth(Border.controlSpec("selected", Color.menu.text, Color.accent), Math.max(Style.space(2), Style.selectedBorderWidth))
       : Border.controlSpec(pointer.containsMouse ? "hover-cursor" : "normal", Color.menu.text, Color.accent)
+  }
+
+  Rectangle {
+    visible: root.marked
+    z: 3
+    anchors.top: parent.top
+    anchors.right: parent.right
+    anchors.margins: Style.space(7)
+    width: Style.space(22)
+    height: width
+    radius: width / 2
+    color: Color.accent
+    Text { anchors.centerIn: parent; text: "✓"; color: Color.menu.selectedText; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
   }
 
   MouseArea {

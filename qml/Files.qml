@@ -82,6 +82,10 @@ Item {
     stdinEnabled: true
     onStarted: root.backendReady = false
     onExited: function(exitCode, exitStatus) {
+      // Quickshell's Process.running is desired state and may remain true when
+      // an external signal kills the child. Clear it so the restart timer can
+      // create a fresh process instead of mistaking a dead helper for a live one.
+      backend.running = false
       root.backendReady = false
       root.helperMessage({event: "error", operation: "backend", message: "File helper stopped; reconnecting…"})
       if (root.opened) backendRestart.restart()

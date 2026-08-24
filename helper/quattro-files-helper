@@ -24,6 +24,7 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", 
 VIDEO_EXT = {".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".wmv", ".flv", ".mpeg", ".mpg", ".ts", ".mts", ".m2ts", ".ogv", ".3gp"}
 WORKERS = 3
 write_lock = threading.Lock()
+ACTIVE_GENERATION = 0
 
 
 def emit(obj: dict) -> None:
@@ -124,11 +125,40 @@ def find_directories(req: dict) -> None:
     root = pathlib.Path(raw_root).expanduser()
     skipped = {"node_modules", "__pycache__", ".git", ".cache"}
     found = 0
+    seen = set()
     try:
         root = root.resolve(strict=True)
         if not root.is_dir():
             raise NotADirectoryError(str(root))
         emit({"event": "directories-begin", "requestId": request_id, "root": str(root)})
+        seeds = req.get("seeds", [])
+        if isinstance(seeds, list):
+            for seed in seeds[:200]:
+                if not isinstance(seed, dict):
+                    continue
+                candidate = pathlib.Path(str(seed.get("path", ""))).expanduser()
+                try:
+                    candidate = candidate.resolve(strict=True)
+                    if not candidate.is_dir() or str(candidate) in seen:
+                        continue
+                    seen.add(str(candidate))
+                    emit({"event": "directory-entry", "requestId": request_id, "path": str(candidate),
+                          "name": candidate.name or str(candidate), "relative": str(candidate),
+                          "source": str(seed.get("source", "recent"))})
+                except OSError:
+                    continue
+        if shutil.which("zoxide"):
+            try:
+                result = subprocess.run(["zoxide", "query", "-l"], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, timeout=2, check=False, text=True)
+                for raw in result.stdout.splitlines()[:300]:
+                    candidate = pathlib.Path(raw)
+                    if candidate.is_dir() and str(candidate) not in seen:
+                        seen.add(str(candidate))
+                        emit({"event": "directory-entry", "requestId": request_id, "path": str(candidate),
+                              "name": candidate.name or str(candidate), "relative": str(candidate), "source": "zoxide"})
+            except (OSError, subprocess.SubprocessError):
+                pass
         queue = collections.deque([(root, 0)])
         while queue and found < max_results:
             parent, depth = queue.popleft()
@@ -151,6 +181,10 @@ def find_directories(req: dict) -> None:
                 for child in children:
                     if found >= max_results:
                         break
+                    if str(child) in seen:
+                        queue.append((child, depth + 1))
+                        continue
+                    seen.add(str(child))
                     found += 1
                     emit({"event": "directory-entry", "requestId": request_id,
                           "path": str(child), "name": child.name,
@@ -189,20 +223,27 @@ def generate_thumbnail(req: dict) -> None:
     raw_path = str(req.get("path", ""))
     width = max(64, min(2560, int(req.get("width", 640))))
     kind = str(req.get("kind", "image"))
+    generation = int(req.get("generation", 0) or 0)
     path = pathlib.Path(raw_path)
     try:
+        if generation and generation != ACTIVE_GENERATION:
+            return
         st = path.stat()
         key = cache_key(path, st, width)
         directory = CACHE / key[:2]
         image = directory / (key + ".jpg")
         meta_file = image.with_suffix(".json")
         if image.is_file() and meta_file.is_file():
+            if generation and generation != ACTIVE_GENERATION:
+                return
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             emit({"event": "thumbnail", "requestId": request_id, "path": raw_path,
                   "thumbnail": str(image), **meta})
             return
         directory.mkdir(parents=True, exist_ok=True)
         meta = probe(path)
+        if generation and generation != ACTIVE_GENERATION:
+            return
         temp = directory / (key + ".tmp.jpg")
         vf = f"scale='min({width},iw)':-2:flags=lanczos,format=yuvj420p"
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
@@ -216,6 +257,9 @@ def generate_thumbnail(req: dict) -> None:
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=35, check=False)
             if cp.returncode != 0 or not temp.is_file():
                 raise RuntimeError(cp.stderr.decode("utf-8", "replace").strip() or "thumbnail generation failed")
+        if generation and generation != ACTIVE_GENERATION:
+            temp.unlink(missing_ok=True)
+            return
         os.replace(temp, image)
         meta_file.write_text(json.dumps(meta, separators=(",", ":")), encoding="utf-8")
         emit({"event": "thumbnail", "requestId": request_id, "path": raw_path,
@@ -278,6 +322,39 @@ def action(req: dict) -> None:
                 raise ValueError("State must be an object")
             save_state(value)
             emit({"event": "action", "requestId": request_id, "operation": op, "ok": True})
+        elif op == "transfer":
+            mode = str(req.get("mode", "copy"))
+            values = req.get("paths", [])
+            destination_dir = pathlib.Path(str(req.get("destination", "")))
+            if mode not in ("copy", "move") or not isinstance(values, list) or not values:
+                raise ValueError("Invalid transfer request")
+            if len(values) > 5000 or not destination_dir.is_dir():
+                raise ValueError("Invalid transfer destination")
+            prepared = []
+            resolved_destination = destination_dir.resolve()
+            for raw_source in values:
+                source = pathlib.Path(str(raw_source))
+                if not source.exists() and not source.is_symlink():
+                    raise FileNotFoundError(str(source))
+                destination = destination_dir / source.name
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError(f"{source.name} already exists")
+                if source.is_dir() and resolved_destination.is_relative_to(source.resolve()):
+                    raise ValueError("Cannot copy a directory into itself")
+                prepared.append((source, destination))
+            completed = []
+            for source, destination in prepared:
+                if mode == "move":
+                    shutil.move(str(source), str(destination))
+                elif source.is_symlink():
+                    os.symlink(os.readlink(source), destination)
+                elif source.is_dir():
+                    shutil.copytree(source, destination, symlinks=True)
+                else:
+                    shutil.copy2(source, destination, follow_symlinks=False)
+                completed.append(str(destination))
+            emit({"event": "action", "requestId": request_id, "operation": op,
+                  "ok": True, "mode": mode, "count": len(completed), "paths": completed})
         else:
             raise ValueError("Unsupported operation")
     except Exception as exc:
@@ -285,6 +362,7 @@ def action(req: dict) -> None:
 
 
 def main() -> int:
+    global ACTIVE_GENERATION
     if len(sys.argv) != 2 or sys.argv[1] != "serve":
         print("usage: quattro-files-helper serve", file=sys.stderr)
         return 2
@@ -301,8 +379,16 @@ def main() -> int:
                     threading.Thread(target=find_directories, args=(req,), daemon=True).start()
                 elif command == "thumbnail":
                     pool.submit(generate_thumbnail, req)
+                elif command == "generation":
+                    ACTIVE_GENERATION = int(req.get("generation", 0) or 0)
                 elif command == "action":
-                    pool.submit(action, req)
+                    # State writes are tiny and must retain protocol order;
+                    # running them in the worker pool can let an older save
+                    # finish after a newer one and silently revert settings.
+                    if req.get("operation") == "state":
+                        action(req)
+                    else:
+                        pool.submit(action, req)
                 elif command == "ping":
                     emit({"event": "pong"})
                 elif command == "quit":

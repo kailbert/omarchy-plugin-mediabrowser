@@ -17,6 +17,7 @@ Item {
   property string zoomSource: ""
   property real zoomFactor: 0
   property bool controlsVisible: true
+  property bool infoVisible: false
   property bool pendingCenter: false
   property var pendingZoomAnchor: null
   readonly property var current: currentIndex >= 0 && currentIndex < rows.length ? rows[currentIndex] : null
@@ -30,11 +31,14 @@ Item {
     if (index < 0 || index >= rows.length) return
     currentIndex = index
     controlsVisible = true
+    infoVisible = false
     opened = true
     loadCurrent()
   }
 
   function close() {
+    var wasOpened = opened
+    var closingIndex = currentIndex
     player.stop()
     player.source = ""
     animated.playing = false
@@ -45,7 +49,7 @@ Item {
     pendingCenter = false
     pendingZoomAnchor = null
     opened = false
-    closeRequested(currentIndex)
+    if (wasOpened && closingIndex >= 0) closeRequested(closingIndex)
   }
 
   function loadCurrent() {
@@ -90,6 +94,10 @@ Item {
   function toggleMute() { audio.muted = !audio.muted }
 
   function toggleControls() { controlsVisible = !controlsVisible }
+  function toggleInfo() { infoVisible = !infoVisible }
+  function openExternal() { if (current) Quickshell.execDetached(["xdg-open", current.path]) }
+  function copyCurrentPath() { if (current) Quickshell.execDetached(["wl-copy", current.path]) }
+  function adjustVolume(delta) { audio.volume = Math.max(0, Math.min(1, audio.volume + delta)) }
 
   function fitImage() {
     zoomFactor = 0
@@ -237,12 +245,16 @@ Item {
       HoverHandler { cursorShape: panDrag.active ? Qt.ClosedHandCursor : Qt.OpenHandCursor }
     }
 
-    WheelHandler {
+    // A MouseArea with no accepted buttons receives wheel and touchpad-scroll
+    // events without competing with the Flickable/DragHandler for a pointer
+    // grab. WheelHandler arbitration allowed some Wayland devices to scroll
+    // the underlying viewport instead of reaching our zoom callback.
+    MouseArea {
+      anchors.fill: parent
       enabled: root.current && !root.isVideo && !root.isGif
-      target: null
-      blocking: true
-      orientation: Qt.Vertical
-      acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+      acceptedButtons: Qt.NoButton
+      scrollGestureEnabled: true
+      preventStealing: true
       onWheel: function(event) {
         var delta = event.angleDelta.y
         var multiplier
@@ -308,6 +320,31 @@ Item {
     elide: Text.ElideRight
     font.family: Style.font.family
     font.pixelSize: Style.font.body
+  }
+
+  BorderSurface {
+    visible: root.infoVisible && root.current
+    z: 4
+    anchors.left: parent.left
+    anchors.top: parent.top
+    anchors.margins: Style.space(18)
+    width: Math.min(parent.width - Style.space(36), Style.space(390))
+    height: infoColumn.implicitHeight + Style.space(24)
+    radius: Style.cornerRadius
+    color: Qt.rgba(0, 0, 0, .76)
+    borderSpec: Border.withWidth(Border.controlSpec("normal", "white", Color.accent), 1)
+    Column {
+      id: infoColumn
+      anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+      anchors.margins: Style.space(12)
+      spacing: Style.spacing.xs
+      Text { width: parent.width; text: root.current ? root.current.name : ""; color: "white"; font.family: Style.font.family; font.pixelSize: Style.font.body; font.bold: true; elide: Text.ElideMiddle }
+      Text { text: root.current ? String(root.current.mime || root.current.kind) : ""; color: "white"; opacity: .58; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+      Text { text: root.current && root.current.width ? root.current.width + " × " + root.current.height : ""; visible: text.length > 0; color: "white"; opacity: .72; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+      Text { text: root.current ? BrowserModel.formatBytes(root.current.size || 0) : ""; color: "white"; opacity: .72; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+      Text { text: root.current && root.current.mtime ? new Date(root.current.mtime * 1000).toLocaleString() : ""; visible: text.length > 0; color: "white"; opacity: .72; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+      Text { width: parent.width; text: root.current ? root.current.path : ""; color: "white"; opacity: .48; font.family: Style.font.family; font.pixelSize: Style.font.caption; elide: Text.ElideMiddle }
+    }
   }
 
   Item {
@@ -429,6 +466,14 @@ Item {
         MouseArea { id: muteMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.toggleMute() }
       }
 
+      Text {
+        visible: root.isVideo
+        anchors.verticalCenter: parent.verticalCenter
+        text: Math.round(audio.volume * 100) + "%"
+        color: "white"; opacity: .52
+        font.family: Style.font.family; font.pixelSize: Style.font.caption
+      }
+
       Item { width: 1; height: 1 }
 
       Text {
@@ -453,8 +498,8 @@ Item {
 
     Text {
       anchors.top: parent.top; anchors.right: parent.right; anchors.margins: Style.space(18)
-      text: root.isVideo ? "Q / ESC  close   SPACE  play/pause   ← →  seek   [ ]  browse"
-                         : "Q / ESC  close   1  100%   wheel  zoom   drag  pan"
+      text: root.isVideo ? "Q / ESC  close   H L  browse   ← →  seek   J K  volume"
+                         : "Q / ESC  close   H L  browse   1  100%   wheel  zoom"
       color: "white"; opacity: .58
       font.family: Style.font.family; font.pixelSize: Style.font.caption
     }
