@@ -13,7 +13,13 @@ Item {
   property bool opened: false
   property bool closingFromHost: false
   property bool backendReady: false
-  property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
+  // Omarchy 4.0.3 gives third-party plugins a public manifest that omits
+  // private registry fields such as __sourceDir. The configured plugin path
+  // remains stable for both a normal install and a local-development symlink.
+  property string pluginId: manifest && manifest.id ? String(manifest.id) : "quattro.files"
+  property string pluginDir: manifest && manifest.__sourceDir
+    ? String(manifest.__sourceDir)
+    : Quickshell.env("HOME") + "/.config/omarchy/plugins/" + pluginId
   property string helperPath: pluginDir + "/helper/quattro-files-helper"
   property string watchPath: ""
   property int requestCounter: 0
