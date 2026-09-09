@@ -117,7 +117,7 @@ After editing user Hyprland bindings, run `hyprctl reload` and
 | `Ctrl+U` / `Ctrl+D` | Scroll half a page |
 | `Backspace` | Parent directory |
 | `H` / `L` | Back / forward |
-| `gh` / `gp` | Home / Pictures |
+| `gh` / `gp` / `gd` / `gv` | Home / Pictures / Downloads / Videos |
 | `/` or `Ctrl+F` | Filter current folder |
 | `c` | Open the fuzzy recent/bookmark/directory jumper |
 | `b` | Bookmark or unbookmark the current directory |

@@ -34,8 +34,8 @@ Item {
       for (var j = 1; j < count; j++) if (heights[j] < heights[column]) column = j
       var aspect = Math.max(0.15, Number(row.aspect || 1.333))
       var visualHeight
-      if (row.kind === "folder") visualHeight = Math.min(Style.space(128), cellWidth * .58)
-      else if (row.kind === "file") visualHeight = Math.min(Style.space(105), cellWidth * .48)
+      if (row.kind === "folder" || row.kind === "file")
+        visualHeight = Math.min(Style.space(128), cellWidth * .58)
       else visualHeight = Math.max(cellWidth * .25, Math.min(cellWidth * 2.65, cellWidth / aspect))
       var labelHeight = showLabels ? Style.space(31) : 0
       var tileHeight = Math.round(visualHeight + labelHeight)

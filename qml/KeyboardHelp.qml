@@ -18,6 +18,7 @@ Item {
     ["Backspace", "Parent folder"],
     ["H / L", "Back / forward"],
     ["gh / gp", "Home / Pictures"],
+    ["gd / gv", "Downloads / Videos"],
     ["/ / Ctrl+F", "Filter folder"],
     ["c", "Fuzzy directory jump"],
     ["b", "Bookmark this directory"],

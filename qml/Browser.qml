@@ -177,6 +177,16 @@ BorderSurface {
 
   function goParent() { navigate(BrowserModel.parentPath(currentDirectory), true) }
 
+  function goToPlace(name) {
+    for (var i = 0; i < places.length; i++) {
+      if (places[i].name === name) {
+        navigate(places[i].path, true)
+        return true
+      }
+    }
+    return false
+  }
+
   function rememberCurrentView() {
     if (!currentDirectory) return
     var copy = ({})
@@ -645,9 +655,10 @@ BorderSurface {
         vimChordTimer.stop()
         if (chord === "g" && event.text === "g") root.select(0)
         else if (chord === "g" && event.text === "h") root.navigate(root.homePath, true)
-        else if (chord === "g" && event.text === "p") {
-          for (var pi = 0; pi < root.places.length; pi++) if (root.places[pi].name === "Pictures") { root.navigate(root.places[pi].path, true); break }
-        } else if (chord === "z" && event.text === "z") masonry.centerSelected(root.selectedIndex, "center")
+        else if (chord === "g" && event.text === "p") root.goToPlace("Pictures")
+        else if (chord === "g" && event.text === "d") root.goToPlace("Downloads")
+        else if (chord === "g" && event.text === "v") root.goToPlace("Videos")
+        else if (chord === "z" && event.text === "z") masonry.centerSelected(root.selectedIndex, "center")
         else if (chord === "z" && event.text === "t") masonry.centerSelected(root.selectedIndex, "top")
         else if (chord === "z" && event.text === "b") masonry.centerSelected(root.selectedIndex, "bottom")
         else return
